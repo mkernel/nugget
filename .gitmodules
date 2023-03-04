@@ -1,0 +1,3 @@
+[submodule "experiments/mpr121_tests/pico-mpr121"]
+	path = experiments/mpr121_tests/pico-mpr121
+	url = git@github.com:antgon/pico-mpr121.git
