@@ -13,6 +13,8 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
+add_subdirectory(pico-mpr121/lib mpr121)
+
 
 if (PICO_SDK_VERSION_STRING VERSION_LESS "1.4.0")
   message(FATAL_ERROR "Raspberry Pi Pico SDK version 1.4.0 (or later) required. Your version is ${PICO_SDK_VERSION_STRING}")
@@ -36,7 +38,8 @@ pico_enable_stdio_usb(mpr121_tests 1)
 # Add the standard library to the build
 target_link_libraries(mpr121_tests
         pico_stdlib
-        hardware_i2c)
+        hardware_i2c
+        pico-mpr121)
 
 # Add the standard include files to the build
 target_include_directories(mpr121_tests PRIVATE

@@ -3,6 +3,7 @@
 #include "pico/stdlib.h"
 #include "pico/binary_info.h"
 #include "hardware/i2c.h"
+#include "mpr121.h"
 
 // I2C reserves some addresses for special purposes. We exclude these from the scan.
 // These are any addresses of the form 000 0xxx or 111 1xxx
@@ -44,6 +45,34 @@ void i2cscan() {
 
 }
 
+void mpr() {
+    int mpr_addr=0x5A;
+    int mpr_freq=100000;
+    i2c_init(i2c_default, mpr_freq);
+    gpio_set_function(PICO_DEFAULT_I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(PICO_DEFAULT_I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(PICO_DEFAULT_I2C_SDA_PIN);
+    gpio_pull_up(PICO_DEFAULT_I2C_SCL_PIN);
+
+    struct mpr121_sensor mpr121;
+    mpr121_init(i2c_default, mpr_addr, &mpr121);
+    mpr121_set_thresholds(12,
+                          6, &mpr121);
+    // Enable only n=1 electrode (electrode 0).
+    mpr121_enable_electrodes(1, &mpr121);
+    const uint8_t electrode = 0;
+    bool is_touched;
+    uint16_t baseline, filtered;
+
+    while(1) {
+        mpr121_is_touched(electrode, &is_touched, &mpr121);
+        mpr121_filtered_data(electrode, &filtered, &mpr121);
+        mpr121_baseline_value(electrode, &baseline, &mpr121);
+        printf("%d %d %d\n", baseline, filtered, is_touched);
+        sleep_ms(100);
+    }
+}
+
 
 int main()
 {
@@ -63,7 +92,9 @@ int main()
                     puts("OK - mpr tests v0.1");
                 } else if(strcmp(current,"ATSCAN")==0) {
                     i2cscan();
-                } else {
+                } else if(strcmp(current,"ATMPR")==0) {
+                    mpr();
+                }else {
                     puts("invalid command: ");
                     puts(current);
                 }
