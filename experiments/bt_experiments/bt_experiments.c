@@ -9,6 +9,8 @@
 enum bt_action {
     NOP,
     INIT,
+    STARTSCAN,
+    STOPSCAN
 };
 
 struct bt_command {
@@ -21,6 +23,31 @@ struct output {
 
 queue_t command_queue;
 queue_t output_queue;
+
+struct ble_device {
+    bd_addr_t address;
+    char name[64];
+    bool long_name;
+    bool name_found;
+};
+
+struct ble_device found_devices[64];
+int free_device=0;
+
+int find_device(bd_addr_t addr) {
+    for(int i=0;i<free_device;i++) {
+        bool equal = true;
+        for(int j =0;j<sizeof(bd_addr_t);j++) {
+            if(addr[j] != found_devices[i].address[j]) {
+                equal = false;
+            }
+        }
+        if(equal) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 void comm_runloop()
 {
@@ -49,6 +76,18 @@ void comm_runloop()
                     cmd.action=INIT;
                     if(!queue_try_add(&command_queue,(void*)&cmd)) {
                         puts("ERR - BT subsystem nonresponsive");
+                    }
+                } else if(strcmp(current,"ATSTARTSCAN")==0) {
+                    struct bt_command cmd;
+                    cmd.action=STARTSCAN;
+                    if(!queue_try_add(&command_queue,(void*)&cmd)) {
+                        puts("ERR - BT subsystem nonresponsive");
+                    }
+                } else if(strcmp(current,"ATSTOPSCAN")==0) {
+                    struct bt_command cmd;
+                    cmd.action=STOPSCAN;
+                    if(!queue_try_add(&command_queue,(void*)&cmd)) {
+                        puts("ERR - BT Subsystem nonresponsive");
                     }
                 }
             } else {
@@ -98,6 +137,79 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             }
             break;
         case GAP_EVENT_ADVERTISING_REPORT:
+            {
+                bd_addr_t address;
+                gap_event_advertising_report_get_address(packet, address);
+                uint8_t event_type = gap_event_advertising_report_get_advertising_event_type(packet);
+                uint8_t address_type = gap_event_advertising_report_get_address_type(packet);
+                int8_t rssi = gap_event_advertising_report_get_rssi(packet);
+                uint8_t length = gap_event_advertising_report_get_data_length(packet);
+                const uint8_t * adv_data = gap_event_advertising_report_get_data(packet);
+                ad_context_t context;
+                char name[128];
+                bool namefound=false;
+                bool longname=false;
+                for (ad_iterator_init(&context, length, (uint8_t *)adv_data) ; ad_iterator_has_more(&context) ; ad_iterator_next(&context)){
+                    uint8_t data_type  = ad_iterator_get_data_type(&context);
+                    uint8_t size     = ad_iterator_get_data_len(&context);
+                    const uint8_t * data = ad_iterator_get_data(&context);
+                    if(data_type == BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME) {
+                        char *walk = name;
+                        for(int i=0;i<size;i++) {
+                            *walk=data[i];
+                            walk++;
+                        }
+                        *walk=0;
+                        namefound=true;
+                        longname=true;
+                    }
+                    if(data_type == BLUETOOTH_DATA_TYPE_SHORTENED_LOCAL_NAME) {
+                        if(!namefound) {
+                            char *walk = name;
+                            for(int i=0;i<size;i++) {
+                                *walk=data[i];
+                                walk++;
+                            }
+                            *walk=0;
+                            namefound=true;
+                        }
+                    }
+                }
+                bool update = false;
+                int idx = find_device(address);
+                if(idx == -1) {
+                    if(free_device >=64) {
+                        qprint("ERR - more than 64 devices in reach");
+                    }
+                    else {
+                        idx = free_device;
+                        free_device++;
+                        memcpy(found_devices[idx].address,address,sizeof(bd_addr_t));
+                        if(namefound) {
+                            strcpy(found_devices[idx].name,name);
+                        }
+                        found_devices[idx].long_name=longname;
+                        found_devices[idx].name_found=namefound;
+                        update = true;
+                    }
+                } else {
+                    if(namefound) {
+                        if(!found_devices[idx].name_found || (longname && !found_devices[idx].long_name)) {
+                            strcpy(found_devices[idx].name,name);
+                            found_devices[idx].name_found=namefound;
+                            found_devices[idx].long_name=longname;
+                            update=true;
+                        }
+                    }
+                }
+                if(update) {
+                    if(found_devices[idx].name_found) {
+                        qprintf("* %s: %s",bd_addr_to_str(found_devices[idx].address),found_devices[idx].name);
+                    } else {
+                        qprintf("* %s",bd_addr_to_str(found_devices[idx].address));
+                    }
+                }
+            }
             break;
         default:
             break;
@@ -112,6 +224,14 @@ static void heartbeat_handler(struct btstack_timer_source *ts) {
             qprint("OK - NOP executed");
         } else if(cmd.action == INIT) {
             qprint("ERR - already initialized");
+        } else if(cmd.action == STARTSCAN) {
+            free_device = 0;
+            gap_set_scan_parameters(0,0x30,0x400);
+            gap_start_scan();
+            qprint("OK - scan initialized");
+        } else if(cmd.action == STOPSCAN) {
+            gap_stop_scan();
+            qprint("OK - scan cancelled");
         }
     }
 
