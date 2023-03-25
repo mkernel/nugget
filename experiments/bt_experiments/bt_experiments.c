@@ -5,12 +5,14 @@
 #include "pico/cyw43_arch.h"
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
+#include "hardware/watchdog.h"
 
 enum bt_action {
     NOP,
     INIT,
     STARTSCAN,
-    STOPSCAN
+    STOPSCAN,
+    OVERWATCH,
 };
 
 struct bt_command {
@@ -32,6 +34,9 @@ struct ble_device {
 };
 
 struct ble_device found_devices[64];
+bd_addr_t overwatch;
+bool overwatch_mode;
+bool present;
 int free_device=0;
 
 int find_device(bd_addr_t addr) {
@@ -89,6 +94,46 @@ void comm_runloop()
                     if(!queue_try_add(&command_queue,(void*)&cmd)) {
                         puts("ERR - BT Subsystem nonresponsive");
                     }
+                } else if(strcmp(current,"ATREBOOT")==0) {
+                    watchdog_enable(1,1);
+                    while(true);
+                } else if(strcmp(current,"ATOVERWATCH")==0) {
+                    struct bt_command cmd;
+                    cmd.action=OVERWATCH;
+                    if(!queue_try_add(&command_queue,(void*)&cmd)) {
+                        puts("ERR - BT subsystem nonresponsive");
+                    }
+                } else if(current[0]=='A' && current[1]=='T' && current[2]=='+') {
+                    //this is a variable access. its either read or write.
+                    //the pattern is AT+{VARIABLE}? for reading and
+                    //AT+{VARIABLE}={VALUE} for writing.
+                    int idx=3;
+                    bool read=false;
+                    bool write=false;
+                    while(current[idx]!='?' && current[idx]!='=') {
+                        idx++;
+                        if(current[idx]==0) break;
+                        if(current[idx]=='?') read=true;
+                        if(current[idx]=='=') write=true;
+                    }
+                    if(!read && !write) {
+                        puts("ERR - Syntax");
+                    } else {
+                        char variable[32];
+                        memcpy(variable,current+3,idx-3);
+                        variable[idx-3]=0;
+                        if(strcmp(variable,"OVERWATCH")==0) {
+                            if(write) {
+                                char value[128];
+                                strcpy(value,current+idx+1);
+                                sscanf_bd_addr(value,overwatch);
+                            } else {
+                                puts(bd_addr_to_str(overwatch));
+                            }
+                        } else {
+                            printf("ERR - Unknown Variable %s\n",variable);
+                        }
+                    }
                 }
             } else {
                 putchar(input);
@@ -119,7 +164,12 @@ void qprintf(char *msg, ...) {
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 static btstack_timer_source_t heartbeat;
+static btstack_timer_source_t overwatch_timeout;
 
+static void overwatch_timeout_handler(struct btstack_timer_source *ts) {
+    qprint("OVERWATCH - disappeared");
+    present=false;
+}
 
 static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     UNUSED(size);
@@ -140,31 +190,40 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             {
                 bd_addr_t address;
                 gap_event_advertising_report_get_address(packet, address);
-                uint8_t event_type = gap_event_advertising_report_get_advertising_event_type(packet);
-                uint8_t address_type = gap_event_advertising_report_get_address_type(packet);
-                int8_t rssi = gap_event_advertising_report_get_rssi(packet);
-                uint8_t length = gap_event_advertising_report_get_data_length(packet);
-                const uint8_t * adv_data = gap_event_advertising_report_get_data(packet);
-                ad_context_t context;
-                char name[128];
-                bool namefound=false;
-                bool longname=false;
-                for (ad_iterator_init(&context, length, (uint8_t *)adv_data) ; ad_iterator_has_more(&context) ; ad_iterator_next(&context)){
-                    uint8_t data_type  = ad_iterator_get_data_type(&context);
-                    uint8_t size     = ad_iterator_get_data_len(&context);
-                    const uint8_t * data = ad_iterator_get_data(&context);
-                    if(data_type == BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME) {
-                        char *walk = name;
-                        for(int i=0;i<size;i++) {
-                            *walk=data[i];
-                            walk++;
+                if(overwatch_mode) {
+                    bool equal=true;
+                    for(int i=0;i<sizeof(bd_addr_t);i++) {
+                        if(overwatch[i] != address[i]) {
+                            equal=false;
                         }
-                        *walk=0;
-                        namefound=true;
-                        longname=true;
                     }
-                    if(data_type == BLUETOOTH_DATA_TYPE_SHORTENED_LOCAL_NAME) {
-                        if(!namefound) {
+                    if(equal) {
+                        if(present) {
+                            btstack_run_loop_remove_timer(&overwatch_timeout);
+                        }
+                        if(!present) {
+                            qprintf("OVERWATCH - appeared %s",bd_addr_to_str(address));
+                            present=true;
+                        }
+                        btstack_run_loop_set_timer(&overwatch_timeout, 5000);
+                        btstack_run_loop_add_timer(&overwatch_timeout);
+
+                    }
+                } else {
+                    uint8_t event_type = gap_event_advertising_report_get_advertising_event_type(packet);
+                    uint8_t address_type = gap_event_advertising_report_get_address_type(packet);
+                    int8_t rssi = gap_event_advertising_report_get_rssi(packet);
+                    uint8_t length = gap_event_advertising_report_get_data_length(packet);
+                    const uint8_t * adv_data = gap_event_advertising_report_get_data(packet);
+                    ad_context_t context;
+                    char name[128];
+                    bool namefound=false;
+                    bool longname=false;
+                    for (ad_iterator_init(&context, length, (uint8_t *)adv_data) ; ad_iterator_has_more(&context) ; ad_iterator_next(&context)){
+                        uint8_t data_type  = ad_iterator_get_data_type(&context);
+                        uint8_t size     = ad_iterator_get_data_len(&context);
+                        const uint8_t * data = ad_iterator_get_data(&context);
+                        if(data_type == BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME) {
                             char *walk = name;
                             for(int i=0;i<size;i++) {
                                 *walk=data[i];
@@ -172,41 +231,53 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                             }
                             *walk=0;
                             namefound=true;
+                            longname=true;
+                        }
+                        if(data_type == BLUETOOTH_DATA_TYPE_SHORTENED_LOCAL_NAME) {
+                            if(!namefound) {
+                                char *walk = name;
+                                for(int i=0;i<size;i++) {
+                                    *walk=data[i];
+                                    walk++;
+                                }
+                                *walk=0;
+                                namefound=true;
+                            }
                         }
                     }
-                }
-                bool update = false;
-                int idx = find_device(address);
-                if(idx == -1) {
-                    if(free_device >=64) {
-                        qprint("ERR - more than 64 devices in reach");
-                    }
-                    else {
-                        idx = free_device;
-                        free_device++;
-                        memcpy(found_devices[idx].address,address,sizeof(bd_addr_t));
-                        if(namefound) {
-                            strcpy(found_devices[idx].name,name);
+                    bool update = false;
+                    int idx = find_device(address);
+                    if(idx == -1) {
+                        if(free_device >=64) {
+                            qprint("ERR - more than 64 devices in reach");
                         }
-                        found_devices[idx].long_name=longname;
-                        found_devices[idx].name_found=namefound;
-                        update = true;
-                    }
-                } else {
-                    if(namefound) {
-                        if(!found_devices[idx].name_found || (longname && !found_devices[idx].long_name)) {
-                            strcpy(found_devices[idx].name,name);
-                            found_devices[idx].name_found=namefound;
+                        else {
+                            idx = free_device;
+                            free_device++;
+                            memcpy(found_devices[idx].address,address,sizeof(bd_addr_t));
+                            if(namefound) {
+                                strcpy(found_devices[idx].name,name);
+                            }
                             found_devices[idx].long_name=longname;
-                            update=true;
+                            found_devices[idx].name_found=namefound;
+                            update = true;
+                        }
+                    } else {
+                        if(namefound) {
+                            if(!found_devices[idx].name_found || (longname && !found_devices[idx].long_name)) {
+                                strcpy(found_devices[idx].name,name);
+                                found_devices[idx].name_found=namefound;
+                                found_devices[idx].long_name=longname;
+                                update=true;
+                            }
                         }
                     }
-                }
-                if(update) {
-                    if(found_devices[idx].name_found) {
-                        qprintf("* %s: %s",bd_addr_to_str(found_devices[idx].address),found_devices[idx].name);
-                    } else {
-                        qprintf("* %s",bd_addr_to_str(found_devices[idx].address));
+                    if(update) {
+                        if(found_devices[idx].name_found) {
+                            qprintf("* %s: %s",bd_addr_to_str(found_devices[idx].address),found_devices[idx].name);
+                        } else {
+                            qprintf("* %s",bd_addr_to_str(found_devices[idx].address));
+                        }
                     }
                 }
             }
@@ -226,12 +297,19 @@ static void heartbeat_handler(struct btstack_timer_source *ts) {
             qprint("ERR - already initialized");
         } else if(cmd.action == STARTSCAN) {
             free_device = 0;
+            overwatch_mode=false;
             gap_set_scan_parameters(0,0x30,0x400);
             gap_start_scan();
             qprint("OK - scan initialized");
         } else if(cmd.action == STOPSCAN) {
             gap_stop_scan();
             qprint("OK - scan cancelled");
+        } else if(cmd.action== OVERWATCH) {
+            free_device = 0;
+            overwatch_mode=true;
+            gap_set_scan_parameters(0,0x30,0x400);
+            gap_start_scan();
+            qprint("OK - overwatching");
         }
     }
 
@@ -260,6 +338,8 @@ void bt_init() {
     heartbeat.process = &heartbeat_handler;
     btstack_run_loop_set_timer(&heartbeat, 50);
     btstack_run_loop_add_timer(&heartbeat);
+
+    overwatch_timeout.process = &overwatch_timeout_handler;
 
     // turn on!
     hci_power_control(HCI_POWER_ON);
